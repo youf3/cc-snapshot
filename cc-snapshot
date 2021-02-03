@@ -15,7 +15,8 @@ OPENSTACK_VENDOR_DATA_2='http://169.254.169.254/openstack/latest/vendor_data2.js
 # ===============================================================================
 ## Chameleon Properties
 # ===============================================================================
-CHAMELEON_OS_AUTH_URL_TMPL='https://sl-ciab.northwestern.edu:5000'
+CHAMELEON_OS_AUTH_URL_TMPL='https://sl-ciab.northwestern.edu:5000/v3'
+PROVENANCE_FILE='/opt/chameleon/provenance.json'
 # ===============================================================================
 ## CC-Snapshot Properties
 # ===============================================================================
@@ -46,7 +47,7 @@ print_usage() {
   echo " cc-snapshot version 0.2.0"
 }
 
-while getopts ":hp:e:f:y" opt; do
+while getopts "hpe:fy" opt; do
   case $opt in
     h)
       print_usage
@@ -77,7 +78,7 @@ done
 #Download latest version, assign versions to variables, curlstat variable ensures update only executes if curl succeeds.
 #------------------------------------------------
 SCRIPT=$0
-curl -s -o /tmp/tmp-snap https://raw.githubusercontent.com/iCAIR-SL/cc-snapshot/master/cc-snapshot
+curl -s -o /tmp/tmp-snap https://raw.githubusercontent.com/ChameleonCloud/cc-snapshot/master/cc-snapshot
 CURLSTAT=$?
 NEWSCRIPT='/tmp/tmp-snap'
 
@@ -109,12 +110,25 @@ fi
 ## each separate version number must be less than 3 digit wide !
 function version { echo "$@" | gawk -F. '{ printf("%03d%03d%03d\n", $1,$2,$3); }'; }
 
-openstackclient_version=$(echo $(pip --disable-pip-version-check freeze | grep python-openstackclient) | awk -F"==" '{ print $2}')
-if [ "$(version "$openstackclient_version")" -lt "$(version "3.18.0")" ]; then
+openstackclient_version=$(echo $(openstack --version 2>&1) | awk -F" " '{ print $2}')
+if [ "$(version "$openstackclient_version")" -lt "$(version "3.16.0")" ]; then
   echo "The openstack client version is too old; please run 'sudo pip install python-openstackclient --upgrade' to update"
+  echo "If you are using python 2, please also run 'sudo pip install --upgrade \"more-itertools<6.0.0\"', since more-itertools (used by openstack client) dropped support of python 2 after version 6.0.0."
   exit 1
 fi
 ###### Check openstackclient version end ######
+
+###### Get provenance properties ######
+PROVENANCE_PROPERTIES=''
+if [ -f "$PROVENANCE_FILE" ]; then
+  for prop in $(cat $PROVENANCE_FILE | tr -d '\n' | tr -d [:space:] | tr -d '{' | tr -d '}' | tr ',' '\n');
+  do
+    prop="${prop/\":\"/=}"
+    prop="$(echo $prop | tr -d '"')"
+    PROVENANCE_PROPERTIES="--property provenance-$prop $PROVENANCE_PROPERTIES"
+  done
+fi
+###### Get provenance properties end ######
 
 set -eu
 set -o pipefail
@@ -154,6 +168,8 @@ cat >$EXCLUDE_FROM <<EOF
 /var/spool/postfix
 # Swift cloudfuse mount
 /home/cc/my_mounting_point
+# Ubuntu lxcfs
+/var/lib/lxcfs
 # User excludes
 $(printf "%s\n" "${EXCLUDE_FOLDERS[@]:-}")
 EOF
@@ -165,6 +181,11 @@ CENTOS='CentOS-Linux'
 UBUNTU_VERSION=''
 if [ $DISTRO = $UBUNTU ]; then
   UBUNTU_VERSION=$(lsb_release -c | awk '{print $2}')
+fi
+
+CENTOS_VERSION=''
+if [ $DISTRO = $CENTOS ]; then
+	CENTOS_VERSION=$(gawk -F= '/^VERSION_ID/{print $2}' /etc/os-release | tr -d \"\' | tr ' ' '-')
 fi
 
 # Configure env for glance to upload image
@@ -183,8 +204,9 @@ if hash jq 2>/dev/null; then
   SITE=$(echo $JSON_VENDOR_DATA | jq -r .site)
   REGION=$(echo $JSON_VENDOR_DATA | jq -r .region)
   PROJECT_ID=$(echo $JSON_VENDOR_DATA | jq -r .project_id)
+  TOKEN=$(echo $JSON_VENDOR_DATA | jq -r .service_token)
 else
-  # jq not available in default xenial repos
+  # jq not available
   function extract_json_key {
     RESULT=$(echo "$2" | sed "s/.*$1\": \"//g" | sed 's/".*//g')
     echo "$RESULT"
@@ -192,6 +214,7 @@ else
   SITE=$(extract_json_key "site" "$JSON_VENDOR_DATA")
   REGION=$(extract_json_key "region" "$JSON_VENDOR_DATA")
   PROJECT_ID=$(extract_json_key "project_id" "$JSON_VENDOR_DATA")
+  TOKEN=$(extract_json_key "service_token" "$JSON_VENDOR_DATA")
 fi
 
 if [ "$SITE" != "tacc" ] && [ "$SITE" != "uc" ] && [ "$SITE" != "nu" ]; then
@@ -207,22 +230,8 @@ if [ -z "$OS_REGION_NAME" ]; then unset OS_REGION_NAME; fi
 export OS_AUTH_URL=$(echo $CHAMELEON_OS_AUTH_URL_TMPL | sed "s/SITE/$SITE/g")
 export OS_IDENTITY_API_VERSION=3
 export OS_PROJECT_ID=$PROJECT_ID
-
-if [ -z "${OS_TOKEN+x}" ]; then
-  if [ -z "${OS_USERNAME+x}" ]; then
-    echo "Please enter your Chameleon username: "
-    read -r OS_USERNAME_INPUT
-    export OS_USERNAME=$OS_USERNAME_INPUT
-  fi
-
-  if [ -z "${OS_PASSWORD+x}" ]; then
-    echo "Please enter your Chameleon password: "
-    read -sr OS_PASSWORD_INPUT
-    export OS_PASSWORD=$OS_PASSWORD_INPUT
-  fi
-
-  export OS_USER_DOMAIN_NAME="Default"
-fi
+export OS_TOKEN=$TOKEN
+export OS_AUTH_TYPE="token"
 
 set +e
 openstack image list >/dev/null #2>&1
@@ -236,7 +245,7 @@ set -e
 # Begin the snapshotting process
 #################################
 
-if [ $DISTRO = $CENTOS ]; then
+if [ $DISTRO = $CENTOS ] && [ $CENTOS_VERSION -eq 7 ]; then
   # Install prerequisite software (only required for XFS file systems, which is the default on CentOS 7):
   yum install -y libguestfs-xfs
   yum update -y lvm2 # must be at least 2.02-171 to avoid bug https://bugzilla.redhat.com/show_bug.cgi?id=1475018
@@ -244,7 +253,7 @@ fi
 
 # Create a tar file of the contents of your instance:
 declare -a TAR_ARGS=(--selinux --acls --numeric-owner --one-file-system --exclude-from $EXCLUDE_FROM)
-if [ "$UBUNTU_VERSION" != "xenial" ]; then
+if [ $DISTRO = $CENTOS ]; then
   TAR_ARGS+=(--xattrs)
 fi
 
@@ -252,7 +261,7 @@ fi
 n=0
 until [ $n -ge 5 ]
 do
-  tar cf $CC_SNAPSHOT_TAR_PATH / ${TAR_ARGS[@]} && break
+  tar --create --file $CC_SNAPSHOT_TAR_PATH ${TAR_ARGS[@]} / && break
   n=$[$n+1]
   sleep 15
 done
@@ -272,8 +281,20 @@ if [ ${LARGE_TAR_CONTINUE,,} != 'yes' ]; then
   exit 0
 fi
 
+[[ -n ${LABEL:-} ]] || {
+  LABEL="$(ls -1 /dev/disk/by-label)"
+  if [[ "$(wc -l <<<"$LABEL")" != "1" ]]; then
+    >&2 echo "Unable to auto-detect disk label: found >1 labeled disks:"
+    >&2 echo "$(sed 's/\n/ - /g' <<<"$LABEL")"
+    >&2 echo "Please try again while explicitly setting the LABEL"
+    >&2 echo "env variable to the desired disk label."
+    exit 1
+  fi
+}
+FS="ext4"
+
 if [ $DISTRO = $UBUNTU ]; then
-  if [ $UBUNTU_VERSION = "xenial" ]; then
+  if [ $UBUNTU_VERSION != "trusty" ]; then
     apt-get install -yq libguestfs-tools
   fi
 
@@ -285,24 +306,10 @@ if [ $DISTRO = $UBUNTU ]; then
   if [ "$(which update-guestfs-appliance)" != "" ]; then
     update-guestfs-appliance || true
   fi
-
-  FS="ext4"
-
-  [[ -n ${LABEL:-} ]] || {
-    LABEL="$(ls -1 /dev/disk/by-label)"
-    if [[ "$(wc -l <<<"$LABEL")" != "1" ]]; then
-      >&2 echo "Unable to auto-detect disk label: found >1 labeled disks:"
-      >&2 echo "$(sed 's/\n/ - /g' <<<"$LABEL")"
-      >&2 echo "Please try again while explicitly setting the LABEL"
-      >&2 echo "env variable to the desired disk label."
-      exit 1
-    fi
-  }
 fi
 
-if [ $DISTRO = $CENTOS ]; then
+if [ $DISTRO = $CENTOS ] && [ $CENTOS_VERSION -eq 7 ]; then
   FS="xfs"
-  LABEL="img-rootfs"
 fi
 
 ARCH=`uname -i`
@@ -361,6 +368,7 @@ if [ "$PARTITION_IMAGE" == false ]; then
   openstack image create \
     --disk-format $CC_SNAPSHOT_DISK_FORMAT \
     --container-format bare \
+    $PROVENANCE_PROPERTIES \
     $SNAPSHOT_NAME <$CC_SNAPSHOT_CONVERTED_COMPRESSED_PATH
 else
   echo "You asked for a partition image."
